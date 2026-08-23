@@ -1,0 +1,11 @@
+[package]
+name = "rat-repeller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+crossterm = "0.29.0"
+image = "0.25.10"
+ratatui = "0.30.2"
+ratatui-image = "11.0.6"
