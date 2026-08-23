@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -20,7 +20,7 @@ use ratatui::{Frame, Terminal};
 use ratatui_image::picker::Picker;
 use ratatui_image::{protocol::StatefulProtocol, StatefulImage};
 
-use rat_repeller::SineWaveGenerator;
+use rat_repeller::{Waveform, WaveformGenerator};
 
 const LOGO_PNG: &[u8] = include_bytes!("../docs/logo.png");
 
@@ -28,64 +28,117 @@ const MIN_UI_FREQUENCY: u32 = 20;
 const FREQUENCY_STEP: u32 = 10;
 const FREQUENCY_STEP_LARGE: u32 = 1_000;
 const DEFAULT_FREQUENCY: u32 = 20_000;
-const MODULATION_DEPTH_HZ: f32 = 1_000.0;
+const DEFAULT_MODULATION_DEPTH_HZ: u32 = 1_000;
+const MIN_MODULATION_DEPTH_HZ: u32 = 100;
+const MAX_MODULATION_DEPTH_HZ: u32 = 5_000;
+const MODULATION_DEPTH_STEP_HZ: u32 = 100;
 const DEFAULT_MODULATION_RATE_MILLIHZ: u32 = 300;
 const MIN_MODULATION_RATE_MILLIHZ: u32 = 50;
 const MAX_MODULATION_RATE_MILLIHZ: u32 = 3_000;
 const MODULATION_RATE_STEP_MILLIHZ: u32 = 50;
 const FREQUENCY_HISTORY_LEN: usize = 200;
+const HISTORY_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+/// コールバック呼び出し間隔(≒状態反映のレイテンシ)を抑えるための目標バッファサイズ。
+/// デバイスが対応する範囲内であれば適用し、対応範囲外ならデバイスのデフォルトのままにする。
+const PREFERRED_BUFFER_FRAMES: u32 = 512;
+
+fn waveform_to_u8(w: Waveform) -> u8 {
+    match w {
+        Waveform::Sine => 0,
+        Waveform::Square => 1,
+        Waveform::Sawtooth => 2,
+        Waveform::Triangle => 3,
+    }
+}
+
+fn waveform_from_u8(v: u8) -> Waveform {
+    match v {
+        1 => Waveform::Square,
+        2 => Waveform::Sawtooth,
+        3 => Waveform::Triangle,
+        _ => Waveform::Sine,
+    }
+}
+
+fn debug_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("rat-repeller-debug.log")
+}
+
+fn debug_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(debug_log_path())
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+/// TUIループ(メインスレッド)とオーディオコールバック(cpalの別スレッド)の間で共有する状態。
+/// ロックを取らず、それぞれAtomicで読み書きする。
+struct SharedState {
+    is_on: AtomicBool,
+    frequency: AtomicU32,
+    sweep_enabled: AtomicBool,
+    waveform: AtomicU8,
+    modulation_depth_hz: AtomicU32,
+    modulation_rate_millihz: AtomicU32,
+    effective_frequency_millihz: AtomicU32,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        Self {
+            is_on: AtomicBool::new(false),
+            frequency: AtomicU32::new(DEFAULT_FREQUENCY),
+            sweep_enabled: AtomicBool::new(false),
+            waveform: AtomicU8::new(waveform_to_u8(Waveform::Sine)),
+            modulation_depth_hz: AtomicU32::new(DEFAULT_MODULATION_DEPTH_HZ),
+            modulation_rate_millihz: AtomicU32::new(DEFAULT_MODULATION_RATE_MILLIHZ),
+            effective_frequency_millihz: AtomicU32::new(DEFAULT_FREQUENCY * 1000),
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let is_on = Arc::new(AtomicBool::new(false));
-    let frequency = Arc::new(AtomicU32::new(DEFAULT_FREQUENCY));
-    let sweep_enabled = Arc::new(AtomicBool::new(false));
-    let modulation_rate_millihz = Arc::new(AtomicU32::new(DEFAULT_MODULATION_RATE_MILLIHZ));
-    let effective_frequency_millihz = Arc::new(AtomicU32::new(DEFAULT_FREQUENCY * 1000));
+    let _ = std::fs::remove_file(debug_log_path());
+    let state = Arc::new(SharedState::new());
 
-    let (_stream, sample_rate) = start_audio_stream(
-        Arc::clone(&is_on),
-        Arc::clone(&frequency),
-        Arc::clone(&sweep_enabled),
-        Arc::clone(&modulation_rate_millihz),
-        Arc::clone(&effective_frequency_millihz),
-    )?;
+    let (_stream, sample_rate) = start_audio_stream(Arc::clone(&state))?;
 
     // 出力デバイスのナイキスト周波数未満に上限を抑える(それ以上を指定してもエイリアシングし音にならない)
     let max_ui_frequency = sample_rate / 2 - 1;
-    frequency.store(DEFAULT_FREQUENCY.min(max_ui_frequency), Ordering::Relaxed);
+    state
+        .frequency
+        .store(DEFAULT_FREQUENCY.min(max_ui_frequency), Ordering::Relaxed);
 
     let logo = load_logo_protocol();
 
-    run_tui(
-        &is_on,
-        &frequency,
-        &sweep_enabled,
-        &modulation_rate_millihz,
-        &effective_frequency_millihz,
-        max_ui_frequency,
-        logo,
-    )
+    run_tui(&state, max_ui_frequency, logo)
 }
 
 /// 端末が画像プロトコル(Sixel/Kitty/iTerm2等)に対応していればロゴを読み込む。
 /// 対応していない/検出に失敗した場合はNoneを返し、呼び出し側はテキストタイトルにフォールバックする。
 fn load_logo_protocol() -> Option<StatefulProtocol> {
-    let debug_log = std::env::temp_dir().join("rat-repeller-debug.log");
     let picker = match Picker::from_query_stdio() {
         Ok(p) => p,
         Err(e) => {
-            let _ = std::fs::write(&debug_log, format!("Picker::from_query_stdio: {e:?}\n"));
+            debug_log(&format!("Picker::from_query_stdio: {e:?}"));
             return None;
         }
     };
     let dyn_img = match image::load_from_memory(LOGO_PNG) {
         Ok(img) => img,
         Err(e) => {
-            let _ = std::fs::write(&debug_log, format!("image::load_from_memory: {e:?}\n"));
+            debug_log(&format!("image::load_from_memory: {e:?}"));
             return None;
         }
     };
-    let _ = std::fs::write(&debug_log, "load_logo_protocol: OK\n");
+    debug_log(&format!(
+        "load_logo_protocol: OK picker={picker:?} img_dimensions={:?}",
+        image::GenericImageView::dimensions(&dyn_img)
+    ));
     Some(picker.new_resize_protocol(dyn_img))
 }
 
@@ -102,34 +155,37 @@ fn select_output_config(
     Ok(best.with_max_sample_rate())
 }
 
-fn start_audio_stream(
-    is_on: Arc<AtomicBool>,
-    frequency: Arc<AtomicU32>,
-    sweep_enabled: Arc<AtomicBool>,
-    modulation_rate_millihz: Arc<AtomicU32>,
-    effective_frequency_millihz: Arc<AtomicU32>,
-) -> Result<(cpal::Stream, u32), Box<dyn Error>> {
+fn start_audio_stream(state: Arc<SharedState>) -> Result<(cpal::Stream, u32), Box<dyn Error>> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .ok_or("出力デバイスが見つかりません")?;
     let config = select_output_config(&device)?;
-    let stream_config: cpal::StreamConfig = config.into();
+    let buffer_range = *config.buffer_size();
+    let mut stream_config: cpal::StreamConfig = config.into();
     let sample_rate = stream_config.sample_rate;
     let channels = stream_config.channels as usize;
 
-    let mut generator = SineWaveGenerator::new(sample_rate, DEFAULT_FREQUENCY as f32);
+    if let cpal::SupportedBufferSize::Range { min, max } = buffer_range
+        && (min..=max).contains(&PREFERRED_BUFFER_FRAMES) {
+            stream_config.buffer_size = cpal::BufferSize::Fixed(PREFERRED_BUFFER_FRAMES);
+        }
+    debug_log(&format!("stream_config: {stream_config:?}"));
+
+    let mut generator = WaveformGenerator::new(sample_rate, DEFAULT_FREQUENCY as f32);
 
     let err_fn = |err| eprintln!("オーディオストリームエラー: {err}");
 
     let stream = device.build_output_stream(
         stream_config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            generator.set_on(is_on.load(Ordering::Relaxed));
-            generator.set_frequency(frequency.load(Ordering::Relaxed) as f32);
-            generator.set_sweep_enabled(sweep_enabled.load(Ordering::Relaxed));
-            let rate_hz = modulation_rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
-            generator.set_modulation(MODULATION_DEPTH_HZ, rate_hz);
+            generator.set_on(state.is_on.load(Ordering::Relaxed));
+            generator.set_frequency(state.frequency.load(Ordering::Relaxed) as f32);
+            generator.set_sweep_enabled(state.sweep_enabled.load(Ordering::Relaxed));
+            generator.set_waveform(waveform_from_u8(state.waveform.load(Ordering::Relaxed)));
+            let depth_hz = state.modulation_depth_hz.load(Ordering::Relaxed) as f32;
+            let rate_hz = state.modulation_rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
+            generator.set_modulation(depth_hz, rate_hz);
             for frame in data.chunks_mut(channels) {
                 let sample = generator.next_sample();
                 for value in frame.iter_mut() {
@@ -137,7 +193,9 @@ fn start_audio_stream(
                 }
             }
             let effective_millihz = (generator.effective_frequency() * 1000.0) as u32;
-            effective_frequency_millihz.store(effective_millihz, Ordering::Relaxed);
+            state
+                .effective_frequency_millihz
+                .store(effective_millihz, Ordering::Relaxed);
         },
         err_fn,
         None,
@@ -148,11 +206,7 @@ fn start_audio_stream(
 }
 
 fn run_tui(
-    is_on: &Arc<AtomicBool>,
-    frequency: &Arc<AtomicU32>,
-    sweep_enabled: &Arc<AtomicBool>,
-    modulation_rate_millihz: &Arc<AtomicU32>,
-    effective_frequency_millihz: &Arc<AtomicU32>,
+    state: &Arc<SharedState>,
     max_ui_frequency: u32,
     logo: Option<StatefulProtocol>,
 ) -> Result<(), Box<dyn Error>> {
@@ -162,16 +216,7 @@ fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = ui_loop(
-        &mut terminal,
-        is_on,
-        frequency,
-        sweep_enabled,
-        modulation_rate_millihz,
-        effective_frequency_millihz,
-        max_ui_frequency,
-        logo,
-    );
+    let result = ui_loop(&mut terminal, state, max_ui_frequency, logo);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -182,30 +227,29 @@ fn run_tui(
 
 fn ui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    is_on: &Arc<AtomicBool>,
-    frequency: &Arc<AtomicU32>,
-    sweep_enabled: &Arc<AtomicBool>,
-    modulation_rate_millihz: &Arc<AtomicU32>,
-    effective_frequency_millihz: &Arc<AtomicU32>,
+    state: &Arc<SharedState>,
     max_ui_frequency: u32,
     mut logo: Option<StatefulProtocol>,
 ) -> Result<(), Box<dyn Error>> {
     let mut history: VecDeque<u64> = VecDeque::with_capacity(FREQUENCY_HISTORY_LEN);
+    let mut last_history_update = Instant::now();
 
     loop {
-        let current_effective_hz = effective_frequency_millihz.load(Ordering::Relaxed) / 1000;
-        history.push_back(current_effective_hz as u64);
-        if history.len() > FREQUENCY_HISTORY_LEN {
-            history.pop_front();
+        let current_effective_hz = state.effective_frequency_millihz.load(Ordering::Relaxed) / 1000;
+
+        // キーリピート等でループが高速に回っても、グラフの更新はループ回数でなく実時間間隔で行う
+        if last_history_update.elapsed() >= HISTORY_UPDATE_INTERVAL {
+            history.push_back(current_effective_hz as u64);
+            if history.len() > FREQUENCY_HISTORY_LEN {
+                history.pop_front();
+            }
+            last_history_update = Instant::now();
         }
 
         terminal.draw(|frame| {
             draw(
                 frame,
-                is_on,
-                frequency,
-                sweep_enabled,
-                modulation_rate_millihz,
+                state,
                 current_effective_hz,
                 &history,
                 max_ui_frequency,
@@ -213,9 +257,9 @@ fn ui_loop(
             )
         })?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()? {
+                let freq_step = if key.modifiers.contains(KeyModifiers::SHIFT) {
                     FREQUENCY_STEP_LARGE
                 } else {
                     FREQUENCY_STEP
@@ -224,59 +268,80 @@ fn ui_loop(
                     KeyCode::Char('q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char(' ') => {
-                        let current = is_on.load(Ordering::Relaxed);
-                        is_on.store(!current, Ordering::Relaxed);
+                        let current = state.is_on.load(Ordering::Relaxed);
+                        state.is_on.store(!current, Ordering::Relaxed);
                     }
                     KeyCode::Char('s') => {
-                        let current = sweep_enabled.load(Ordering::Relaxed);
-                        sweep_enabled.store(!current, Ordering::Relaxed);
+                        let current = state.sweep_enabled.load(Ordering::Relaxed);
+                        state.sweep_enabled.store(!current, Ordering::Relaxed);
+                    }
+                    KeyCode::Char('w') => {
+                        let current = waveform_from_u8(state.waveform.load(Ordering::Relaxed));
+                        state
+                            .waveform
+                            .store(waveform_to_u8(current.next()), Ordering::Relaxed);
                     }
                     KeyCode::Up => {
-                        let current = frequency.load(Ordering::Relaxed);
-                        let next = (current + step).min(max_ui_frequency);
-                        frequency.store(next, Ordering::Relaxed);
+                        let current = state.frequency.load(Ordering::Relaxed);
+                        let next = (current + freq_step).min(max_ui_frequency);
+                        state.frequency.store(next, Ordering::Relaxed);
                     }
                     KeyCode::Down => {
-                        let current = frequency.load(Ordering::Relaxed);
-                        let next = current.saturating_sub(step).max(MIN_UI_FREQUENCY);
-                        frequency.store(next, Ordering::Relaxed);
+                        let current = state.frequency.load(Ordering::Relaxed);
+                        let next = current.saturating_sub(freq_step).max(MIN_UI_FREQUENCY);
+                        state.frequency.store(next, Ordering::Relaxed);
                     }
-                    KeyCode::Char(']') => {
-                        let current = modulation_rate_millihz.load(Ordering::Relaxed);
+                    KeyCode::Right => {
+                        let current = state.modulation_rate_millihz.load(Ordering::Relaxed);
                         let next = (current + MODULATION_RATE_STEP_MILLIHZ)
                             .min(MAX_MODULATION_RATE_MILLIHZ);
-                        modulation_rate_millihz.store(next, Ordering::Relaxed);
+                        state
+                            .modulation_rate_millihz
+                            .store(next, Ordering::Relaxed);
                     }
-                    KeyCode::Char('[') => {
-                        let current = modulation_rate_millihz.load(Ordering::Relaxed);
+                    KeyCode::Left => {
+                        let current = state.modulation_rate_millihz.load(Ordering::Relaxed);
                         let next = current
                             .saturating_sub(MODULATION_RATE_STEP_MILLIHZ)
                             .max(MIN_MODULATION_RATE_MILLIHZ);
-                        modulation_rate_millihz.store(next, Ordering::Relaxed);
+                        state
+                            .modulation_rate_millihz
+                            .store(next, Ordering::Relaxed);
+                    }
+                    KeyCode::PageUp => {
+                        let current = state.modulation_depth_hz.load(Ordering::Relaxed);
+                        let next =
+                            (current + MODULATION_DEPTH_STEP_HZ).min(MAX_MODULATION_DEPTH_HZ);
+                        state.modulation_depth_hz.store(next, Ordering::Relaxed);
+                    }
+                    KeyCode::PageDown => {
+                        let current = state.modulation_depth_hz.load(Ordering::Relaxed);
+                        let next = current
+                            .saturating_sub(MODULATION_DEPTH_STEP_HZ)
+                            .max(MIN_MODULATION_DEPTH_HZ);
+                        state.modulation_depth_hz.store(next, Ordering::Relaxed);
                     }
                     _ => {}
                 }
             }
-        }
     }
     Ok(())
 }
 
 fn draw(
     frame: &mut Frame,
-    is_on: &Arc<AtomicBool>,
-    frequency: &Arc<AtomicU32>,
-    sweep_enabled: &Arc<AtomicBool>,
-    modulation_rate_millihz: &Arc<AtomicU32>,
+    state: &Arc<SharedState>,
     current_effective_hz: u32,
     history: &VecDeque<u64>,
     max_ui_frequency: u32,
     logo: Option<&mut StatefulProtocol>,
 ) {
-    let on = is_on.load(Ordering::Relaxed);
-    let freq = frequency.load(Ordering::Relaxed);
-    let sweeping = sweep_enabled.load(Ordering::Relaxed);
-    let rate_hz = modulation_rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
+    let on = state.is_on.load(Ordering::Relaxed);
+    let freq = state.frequency.load(Ordering::Relaxed);
+    let sweeping = state.sweep_enabled.load(Ordering::Relaxed);
+    let waveform = waveform_from_u8(state.waveform.load(Ordering::Relaxed));
+    let depth_hz = state.modulation_depth_hz.load(Ordering::Relaxed);
+    let rate_hz = state.modulation_rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
 
     let title_height = if logo.is_some() { 12 } else { 4 };
 
@@ -314,10 +379,11 @@ fn draw(
         frame.render_widget(title, chunks[0]);
     }
 
-    let status_text = if on { "ON" } else { "OFF" };
+    let status_text = format!("{} / {:?}波", if on { "ON" } else { "OFF" }, waveform);
     let status_color = if on { Color::Green } else { Color::Red };
     let sweep_text = if sweeping {
-        format!("スイープ ON (±{MODULATION_DEPTH_HZ:.0}Hz, {rate_hz:.2}Hz周期)")
+        let period_secs = 1.0 / rate_hz;
+        format!("スイープ ON (±{depth_hz}Hz, 変調速度{rate_hz:.2}Hz=周期{period_secs:.1}秒)")
     } else {
         "スイープ OFF".to_string()
     };
@@ -352,7 +418,7 @@ fn draw(
     frame.render_widget(graph, chunks[3]);
 
     let help = Paragraph::new(format!(
-        "Space: ON/OFF  s: スイープ切替  ↑/↓: {FREQUENCY_STEP}Hz  Shift+↑/↓: {FREQUENCY_STEP_LARGE}Hz  [/]: スイープ速度  q: 終了"
+        "Space: ON/OFF  w: 波形切替  s: スイープ切替  ↑/↓: {FREQUENCY_STEP}Hz  Shift+↑/↓: {FREQUENCY_STEP_LARGE}Hz  ←/→: スイープ速度  PgUp/PgDn: スイープ範囲  q: 終了"
     ))
     .alignment(Alignment::Center)
     .block(Block::default().borders(Borders::ALL).title("操作"));
