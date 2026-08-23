@@ -34,6 +34,10 @@ const DEFAULT_MODULATION_DEPTH_HZ: u32 = 1_000;
 const MIN_MODULATION_DEPTH_HZ: u32 = 100;
 const MAX_MODULATION_DEPTH_HZ: u32 = 5_000;
 const MODULATION_DEPTH_STEP_HZ: u32 = 10;
+const DEFAULT_LFO_RISE_PERCENT: u32 = 50;
+const MIN_LFO_RISE_PERCENT: u32 = 5;
+const MAX_LFO_RISE_PERCENT: u32 = 95;
+const LFO_RISE_STEP_PERCENT: u32 = 5;
 const DEFAULT_MODULATION_RATE_MILLIHZ: u32 = 300;
 const MIN_MODULATION_RATE_MILLIHZ: u32 = 50;
 const MAX_MODULATION_RATE_MILLIHZ: u32 = 100_000;
@@ -87,6 +91,7 @@ struct SharedState {
     waveform: AtomicU8,
     modulation_depth_hz: AtomicU32,
     modulation_rate_millihz: AtomicU32,
+    lfo_rise_percent: AtomicU32,
     effective_frequency_millihz: AtomicU32,
 }
 
@@ -99,6 +104,7 @@ impl SharedState {
             waveform: AtomicU8::new(waveform_to_u8(Waveform::Sine)),
             modulation_depth_hz: AtomicU32::new(DEFAULT_MODULATION_DEPTH_HZ),
             modulation_rate_millihz: AtomicU32::new(DEFAULT_MODULATION_RATE_MILLIHZ),
+            lfo_rise_percent: AtomicU32::new(DEFAULT_LFO_RISE_PERCENT),
             effective_frequency_millihz: AtomicU32::new(DEFAULT_FREQUENCY * 1000),
         }
     }
@@ -163,6 +169,8 @@ fn start_audio_stream(state: Arc<SharedState>) -> Result<(cpal::Stream, u32), Bo
             let depth_hz = state.modulation_depth_hz.load(Ordering::Relaxed) as f32;
             let rate_hz = state.modulation_rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
             generator.set_modulation(depth_hz, rate_hz);
+            let rise_ratio = state.lfo_rise_percent.load(Ordering::Relaxed) as f32 / 100.0;
+            generator.set_lfo_rise_ratio(rise_ratio);
             for frame in data.chunks_mut(channels) {
                 let sample = generator.next_sample();
                 for value in frame.iter_mut() {
@@ -329,11 +337,57 @@ fn ui_loop(
                             .max(MIN_MODULATION_DEPTH_HZ);
                         state.modulation_depth_hz.store(next, Ordering::Relaxed);
                     }
+                    KeyCode::Char('d') => {
+                        let current = state.lfo_rise_percent.load(Ordering::Relaxed);
+                        let next = (current + LFO_RISE_STEP_PERCENT).min(MAX_LFO_RISE_PERCENT);
+                        state.lfo_rise_percent.store(next, Ordering::Relaxed);
+                    }
+                    KeyCode::Char('a') => {
+                        let current = state.lfo_rise_percent.load(Ordering::Relaxed);
+                        let next = current
+                            .saturating_sub(LFO_RISE_STEP_PERCENT)
+                            .max(MIN_LFO_RISE_PERCENT);
+                        state.lfo_rise_percent.store(next, Ordering::Relaxed);
+                    }
                     _ => {}
                 }
             }
     }
     Ok(())
+}
+
+/// 半角=1、全角(非ASCII)=2として文字列の表示幅を概算する。
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// 操作項目を、1行の表示幅が`max_width`を超えないよう複数行に折り返す。
+/// 項目の途中では折り返さない(1項目が`max_width`を超える場合はその項目単独で1行になる)。
+fn wrap_items(items: &[String], max_width: usize) -> Vec<String> {
+    if items.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for item in items {
+        let item_width = display_width(item);
+        let sep_width = if current.is_empty() { 0 } else { 2 };
+        if max_width > 0 && current_width + sep_width + item_width > max_width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push_str("  ");
+            current_width += 2;
+        }
+        current.push_str(item);
+        current_width += item_width;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn draw(
@@ -349,6 +403,23 @@ fn draw(
     let waveform = waveform_from_u8(state.waveform.load(Ordering::Relaxed));
     let depth_hz = state.modulation_depth_hz.load(Ordering::Relaxed);
     let rate_hz = state.modulation_rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
+    let rise_percent = state.lfo_rise_percent.load(Ordering::Relaxed);
+
+    let help_items = vec![
+        "Space:ON/OFF".to_string(),
+        "w:波形切替".to_string(),
+        "s:スイープ切替".to_string(),
+        format!("↑/↓:{FREQUENCY_STEP}Hz"),
+        format!("Shift+↑/↓:{FREQUENCY_STEP_LARGE}Hz"),
+        "←/→:速度0.05Hz".to_string(),
+        "Shift+←/→:速度1Hz".to_string(),
+        "[/]:スイープ範囲".to_string(),
+        "a/d:上昇比率".to_string(),
+        "q:終了".to_string(),
+    ];
+    let help_inner_width = frame.area().width.saturating_sub(2) as usize;
+    let help_lines = wrap_items(&help_items, help_inner_width);
+    let help_height = help_lines.len() as u16 + 2;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -357,7 +428,7 @@ fn draw(
             Constraint::Length(4),
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(help_height),
         ])
         .split(frame.area());
 
@@ -381,7 +452,9 @@ fn draw(
     let status_color = if on { Color::Green } else { Color::Red };
     let sweep_text = if sweeping {
         let period_secs = 1.0 / rate_hz;
-        format!("スイープ ON (±{depth_hz}Hz, 変調速度{rate_hz:.2}Hz=周期{period_secs:.1}秒)")
+        format!(
+            "スイープ ON (±{depth_hz}Hz, 変調速度{rate_hz:.2}Hz=周期{period_secs:.1}秒, 上昇比{rise_percent}%)"
+        )
     } else {
         "スイープ OFF".to_string()
     };
@@ -415,10 +488,54 @@ fn draw(
         .style(Style::default().fg(Color::Green));
     frame.render_widget(graph, chunks[3]);
 
-    let help = Paragraph::new(format!(
-        "Space: ON/OFF  w: 波形切替  s: スイープ切替  ↑/↓: {FREQUENCY_STEP}Hz  Shift+↑/↓: {FREQUENCY_STEP_LARGE}Hz  ←/→: 速度0.05Hz  Shift+←/→: 速度1Hz  [/]: スイープ範囲  q: 終了"
-    ))
+    let help = Paragraph::new(
+        help_lines
+            .iter()
+            .map(|line| Line::from(line.as_str()))
+            .collect::<Vec<_>>(),
+    )
     .alignment(Alignment::Center)
     .block(Block::default().borders(Borders::ALL).title("操作"));
     frame.render_widget(help, chunks[4]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_width_counts_ascii_as_one_and_non_ascii_as_two() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("↑↓"), 4);
+        assert_eq!(display_width("a↑b"), 4);
+    }
+
+    #[test]
+    fn wrap_items_keeps_single_line_when_it_fits() {
+        let items = vec!["a".to_string(), "b".to_string()];
+        let lines = wrap_items(&items, 80);
+        assert_eq!(lines, vec!["a  b".to_string()]);
+    }
+
+    #[test]
+    fn wrap_items_breaks_into_multiple_lines_when_too_narrow() {
+        let items = vec!["aaaa".to_string(), "bbbb".to_string(), "cccc".to_string()];
+        // "aaaa  bbbb" は10幅ちょうどで収まり、次の"cccc"は入らず折り返すはず
+        let lines = wrap_items(&items, 10);
+        assert_eq!(lines, vec!["aaaa  bbbb".to_string(), "cccc".to_string()]);
+    }
+
+    #[test]
+    fn wrap_items_never_splits_a_single_item_across_lines() {
+        // 1項目だけでmax_widthを超えても、その項目単独で1行になる(分割しない)
+        let items = vec!["averylongitemthatoverflows".to_string()];
+        let lines = wrap_items(&items, 5);
+        assert_eq!(lines, vec!["averylongitemthatoverflows".to_string()]);
+    }
+
+    #[test]
+    fn wrap_items_handles_empty_input() {
+        let lines = wrap_items(&[], 80);
+        assert_eq!(lines, vec![String::new()]);
+    }
 }
