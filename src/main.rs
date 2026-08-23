@@ -17,12 +17,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 use ratatui::{Frame, Terminal};
-use ratatui_image::picker::Picker;
-use ratatui_image::{protocol::StatefulProtocol, StatefulImage};
 
 use rat_repeller::{Waveform, WaveformGenerator};
 
+mod pixel_canvas;
+mod splash;
+
 const LOGO_PNG: &[u8] = include_bytes!("../docs/logo.png");
+const SPLASH_DURATION: Duration = Duration::from_secs(2);
 
 const MIN_UI_FREQUENCY: u32 = 20;
 const FREQUENCY_STEP: u32 = 10;
@@ -31,11 +33,12 @@ const DEFAULT_FREQUENCY: u32 = 20_000;
 const DEFAULT_MODULATION_DEPTH_HZ: u32 = 1_000;
 const MIN_MODULATION_DEPTH_HZ: u32 = 100;
 const MAX_MODULATION_DEPTH_HZ: u32 = 5_000;
-const MODULATION_DEPTH_STEP_HZ: u32 = 100;
+const MODULATION_DEPTH_STEP_HZ: u32 = 10;
 const DEFAULT_MODULATION_RATE_MILLIHZ: u32 = 300;
 const MIN_MODULATION_RATE_MILLIHZ: u32 = 50;
-const MAX_MODULATION_RATE_MILLIHZ: u32 = 3_000;
+const MAX_MODULATION_RATE_MILLIHZ: u32 = 100_000;
 const MODULATION_RATE_STEP_MILLIHZ: u32 = 50;
+const MODULATION_RATE_STEP_LARGE_MILLIHZ: u32 = 1_000;
 const FREQUENCY_HISTORY_LEN: usize = 200;
 const HISTORY_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// コールバック呼び出し間隔(≒状態反映のレイテンシ)を抑えるための目標バッファサイズ。
@@ -113,33 +116,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .frequency
         .store(DEFAULT_FREQUENCY.min(max_ui_frequency), Ordering::Relaxed);
 
-    let logo = load_logo_protocol();
-
-    run_tui(&state, max_ui_frequency, logo)
-}
-
-/// 端末が画像プロトコル(Sixel/Kitty/iTerm2等)に対応していればロゴを読み込む。
-/// 対応していない/検出に失敗した場合はNoneを返し、呼び出し側はテキストタイトルにフォールバックする。
-fn load_logo_protocol() -> Option<StatefulProtocol> {
-    let picker = match Picker::from_query_stdio() {
-        Ok(p) => p,
-        Err(e) => {
-            debug_log(&format!("Picker::from_query_stdio: {e:?}"));
-            return None;
-        }
-    };
-    let dyn_img = match image::load_from_memory(LOGO_PNG) {
-        Ok(img) => img,
-        Err(e) => {
-            debug_log(&format!("image::load_from_memory: {e:?}"));
-            return None;
-        }
-    };
-    debug_log(&format!(
-        "load_logo_protocol: OK picker={picker:?} img_dimensions={:?}",
-        image::GenericImageView::dimensions(&dyn_img)
-    ));
-    Some(picker.new_resize_protocol(dyn_img))
+    run_tui(&state, max_ui_frequency)
 }
 
 /// デバイスがF32出力で対応する設定のうち、最大サンプルレートのものを選ぶ。
@@ -205,18 +182,14 @@ fn start_audio_stream(state: Arc<SharedState>) -> Result<(cpal::Stream, u32), Bo
     Ok((stream, sample_rate))
 }
 
-fn run_tui(
-    state: &Arc<SharedState>,
-    max_ui_frequency: u32,
-    logo: Option<StatefulProtocol>,
-) -> Result<(), Box<dyn Error>> {
+fn run_tui(state: &Arc<SharedState>, max_ui_frequency: u32) -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = ui_loop(&mut terminal, state, max_ui_frequency, logo);
+    let result = show_splash(&mut terminal).and_then(|_| ui_loop(&mut terminal, state, max_ui_frequency));
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -225,11 +198,38 @@ fn run_tui(
     result
 }
 
+/// 起動直後にロゴをピクセルアート表示する。何らかのキー入力、または`SPLASH_DURATION`
+/// の経過で閉じる。ロゴのデコードに失敗した場合は何も表示せず即座に抜ける。
+fn show_splash(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
+    let Ok(image) = image::load_from_memory(LOGO_PNG) else {
+        return Ok(());
+    };
+
+    let deadline = Instant::now() + SPLASH_DURATION;
+    loop {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let canvas = splash::build_canvas(&image, area.width, area.height);
+            frame.render_widget(Paragraph::new(canvas.to_lines(1.0)), area);
+        })?;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if event::poll(remaining.min(Duration::from_millis(100)))?
+            && matches!(event::read()?, Event::Key(_))
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn ui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &Arc<SharedState>,
     max_ui_frequency: u32,
-    mut logo: Option<StatefulProtocol>,
 ) -> Result<(), Box<dyn Error>> {
     let mut history: VecDeque<u64> = VecDeque::with_capacity(FREQUENCY_HISTORY_LEN);
     let mut last_history_update = Instant::now();
@@ -253,7 +253,6 @@ fn ui_loop(
                 current_effective_hz,
                 &history,
                 max_ui_frequency,
-                logo.as_mut(),
             )
         })?;
 
@@ -292,29 +291,38 @@ fn ui_loop(
                         state.frequency.store(next, Ordering::Relaxed);
                     }
                     KeyCode::Right => {
+                        let rate_step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            MODULATION_RATE_STEP_LARGE_MILLIHZ
+                        } else {
+                            MODULATION_RATE_STEP_MILLIHZ
+                        };
                         let current = state.modulation_rate_millihz.load(Ordering::Relaxed);
-                        let next = (current + MODULATION_RATE_STEP_MILLIHZ)
-                            .min(MAX_MODULATION_RATE_MILLIHZ);
+                        let next = (current + rate_step).min(MAX_MODULATION_RATE_MILLIHZ);
                         state
                             .modulation_rate_millihz
                             .store(next, Ordering::Relaxed);
                     }
                     KeyCode::Left => {
+                        let rate_step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            MODULATION_RATE_STEP_LARGE_MILLIHZ
+                        } else {
+                            MODULATION_RATE_STEP_MILLIHZ
+                        };
                         let current = state.modulation_rate_millihz.load(Ordering::Relaxed);
                         let next = current
-                            .saturating_sub(MODULATION_RATE_STEP_MILLIHZ)
+                            .saturating_sub(rate_step)
                             .max(MIN_MODULATION_RATE_MILLIHZ);
                         state
                             .modulation_rate_millihz
                             .store(next, Ordering::Relaxed);
                     }
-                    KeyCode::PageUp => {
+                    KeyCode::Char(']') => {
                         let current = state.modulation_depth_hz.load(Ordering::Relaxed);
                         let next =
                             (current + MODULATION_DEPTH_STEP_HZ).min(MAX_MODULATION_DEPTH_HZ);
                         state.modulation_depth_hz.store(next, Ordering::Relaxed);
                     }
-                    KeyCode::PageDown => {
+                    KeyCode::Char('[') => {
                         let current = state.modulation_depth_hz.load(Ordering::Relaxed);
                         let next = current
                             .saturating_sub(MODULATION_DEPTH_STEP_HZ)
@@ -334,7 +342,6 @@ fn draw(
     current_effective_hz: u32,
     history: &VecDeque<u64>,
     max_ui_frequency: u32,
-    logo: Option<&mut StatefulProtocol>,
 ) {
     let on = state.is_on.load(Ordering::Relaxed);
     let freq = state.frequency.load(Ordering::Relaxed);
@@ -343,12 +350,10 @@ fn draw(
     let depth_hz = state.modulation_depth_hz.load(Ordering::Relaxed);
     let rate_hz = state.modulation_rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
 
-    let title_height = if logo.is_some() { 12 } else { 4 };
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(title_height),
+            Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(3),
             Constraint::Min(5),
@@ -356,28 +361,21 @@ fn draw(
         ])
         .split(frame.area());
 
-    if let Some(protocol) = logo {
-        let block = Block::default().borders(Borders::ALL);
-        let inner = block.inner(chunks[0]);
-        frame.render_widget(block, chunks[0]);
-        frame.render_stateful_widget(StatefulImage::default(), inner, protocol);
-    } else {
-        let title = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "((( rat-repeller )))",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "High-frequency sound. Peace of mind.",
-                Style::default().fg(Color::Gray),
-            )),
-        ])
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(title, chunks[0]);
-    }
+    let title = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "((( rat-repeller )))",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "High-frequency sound. Peace of mind.",
+            Style::default().fg(Color::Gray),
+        )),
+    ])
+    .alignment(Alignment::Center)
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(title, chunks[0]);
 
     let status_text = format!("{} / {:?}波", if on { "ON" } else { "OFF" }, waveform);
     let status_color = if on { Color::Green } else { Color::Red };
@@ -418,7 +416,7 @@ fn draw(
     frame.render_widget(graph, chunks[3]);
 
     let help = Paragraph::new(format!(
-        "Space: ON/OFF  w: 波形切替  s: スイープ切替  ↑/↓: {FREQUENCY_STEP}Hz  Shift+↑/↓: {FREQUENCY_STEP_LARGE}Hz  ←/→: スイープ速度  PgUp/PgDn: スイープ範囲  q: 終了"
+        "Space: ON/OFF  w: 波形切替  s: スイープ切替  ↑/↓: {FREQUENCY_STEP}Hz  Shift+↑/↓: {FREQUENCY_STEP_LARGE}Hz  ←/→: 速度0.05Hz  Shift+←/→: 速度1Hz  [/]: スイープ範囲  q: 終了"
     ))
     .alignment(Alignment::Center)
     .block(Block::default().borders(Borders::ALL).title("操作"));
