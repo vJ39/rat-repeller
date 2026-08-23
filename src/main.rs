@@ -20,6 +20,7 @@ use ratatui::{Frame, Terminal};
 
 use rat_repeller::{Waveform, WaveformGenerator};
 
+mod persistence;
 mod pixel_canvas;
 mod splash;
 
@@ -108,6 +109,50 @@ impl SharedState {
             effective_frequency_millihz: AtomicU32::new(DEFAULT_FREQUENCY * 1000),
         }
     }
+
+    /// 前回終了時の設定を適用する。保存済みの値がその後の実行環境で範囲外に
+    /// なっている可能性があるため、現在の許容範囲にクランプしてから反映する。
+    fn apply_persisted(&self, persisted: &persistence::PersistedState, max_ui_frequency: u32) {
+        self.is_on.store(persisted.is_on, Ordering::Relaxed);
+        self.frequency.store(
+            persisted.frequency.clamp(MIN_UI_FREQUENCY, max_ui_frequency),
+            Ordering::Relaxed,
+        );
+        self.waveform.store(persisted.waveform, Ordering::Relaxed);
+        self.sweep_enabled
+            .store(persisted.sweep_enabled, Ordering::Relaxed);
+        self.modulation_depth_hz.store(
+            persisted
+                .modulation_depth_hz
+                .clamp(MIN_MODULATION_DEPTH_HZ, MAX_MODULATION_DEPTH_HZ),
+            Ordering::Relaxed,
+        );
+        self.modulation_rate_millihz.store(
+            persisted
+                .modulation_rate_millihz
+                .clamp(MIN_MODULATION_RATE_MILLIHZ, MAX_MODULATION_RATE_MILLIHZ),
+            Ordering::Relaxed,
+        );
+        self.lfo_rise_percent.store(
+            persisted
+                .lfo_rise_percent
+                .clamp(MIN_LFO_RISE_PERCENT, MAX_LFO_RISE_PERCENT),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn to_persisted(&self, history: &VecDeque<u64>) -> persistence::PersistedState {
+        persistence::PersistedState {
+            is_on: self.is_on.load(Ordering::Relaxed),
+            frequency: self.frequency.load(Ordering::Relaxed),
+            waveform: self.waveform.load(Ordering::Relaxed),
+            sweep_enabled: self.sweep_enabled.load(Ordering::Relaxed),
+            modulation_depth_hz: self.modulation_depth_hz.load(Ordering::Relaxed),
+            modulation_rate_millihz: self.modulation_rate_millihz.load(Ordering::Relaxed),
+            lfo_rise_percent: self.lfo_rise_percent.load(Ordering::Relaxed),
+            history: history.iter().copied().collect(),
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -122,7 +167,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         .frequency
         .store(DEFAULT_FREQUENCY.min(max_ui_frequency), Ordering::Relaxed);
 
-    run_tui(&state, max_ui_frequency)
+    let save_path = persistence::config_path();
+    let persisted = save_path.as_deref().and_then(persistence::load_from);
+    let initial_history: VecDeque<u64> = match &persisted {
+        Some(p) => {
+            state.apply_persisted(p, max_ui_frequency);
+            p.history.iter().copied().collect()
+        }
+        None => VecDeque::new(),
+    };
+
+    let final_history = run_tui(&state, max_ui_frequency, initial_history)?;
+
+    if let Some(path) = &save_path {
+        let to_save = state.to_persisted(&final_history);
+        if let Err(e) = persistence::save_to(path, &to_save) {
+            debug_log(&format!("persistence::save_to failed: {e:?}"));
+        }
+    }
+
+    Ok(())
 }
 
 /// デバイスがF32出力で対応する設定のうち、最大サンプルレートのものを選ぶ。
@@ -190,14 +254,19 @@ fn start_audio_stream(state: Arc<SharedState>) -> Result<(cpal::Stream, u32), Bo
     Ok((stream, sample_rate))
 }
 
-fn run_tui(state: &Arc<SharedState>, max_ui_frequency: u32) -> Result<(), Box<dyn Error>> {
+fn run_tui(
+    state: &Arc<SharedState>,
+    max_ui_frequency: u32,
+    initial_history: VecDeque<u64>,
+) -> Result<VecDeque<u64>, Box<dyn Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = show_splash(&mut terminal).and_then(|_| ui_loop(&mut terminal, state, max_ui_frequency));
+    let result = show_splash(&mut terminal)
+        .and_then(|_| ui_loop(&mut terminal, state, max_ui_frequency, initial_history));
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -238,18 +307,22 @@ fn ui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &Arc<SharedState>,
     max_ui_frequency: u32,
-) -> Result<(), Box<dyn Error>> {
-    let mut history: VecDeque<u64> = VecDeque::with_capacity(FREQUENCY_HISTORY_LEN);
+    initial_history: VecDeque<u64>,
+) -> Result<VecDeque<u64>, Box<dyn Error>> {
+    let mut history = initial_history;
     let mut last_history_update = Instant::now();
 
     loop {
         let current_effective_hz = state.effective_frequency_millihz.load(Ordering::Relaxed) / 1000;
 
-        // キーリピート等でループが高速に回っても、グラフの更新はループ回数でなく実時間間隔で行う
+        // キーリピート等でループが高速に回っても、グラフの更新はループ回数でなく実時間間隔で行う。
+        // OFF中は鳴っていないので履歴を進めず、直前までの推移をそのまま保持する。
         if last_history_update.elapsed() >= HISTORY_UPDATE_INTERVAL {
-            history.push_back(current_effective_hz as u64);
-            if history.len() > FREQUENCY_HISTORY_LEN {
-                history.pop_front();
+            if state.is_on.load(Ordering::Relaxed) {
+                history.push_back(current_effective_hz as u64);
+                if history.len() > FREQUENCY_HISTORY_LEN {
+                    history.pop_front();
+                }
             }
             last_history_update = Instant::now();
         }
@@ -353,7 +426,7 @@ fn ui_loop(
                 }
             }
     }
-    Ok(())
+    Ok(history)
 }
 
 /// 半角=1、全角(非ASCII)=2として文字列の表示幅を概算する。
